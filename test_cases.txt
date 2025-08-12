@@ -1,0 +1,129 @@
+HEALTHCARE AI ASSISTANT - TEST CASES
+=====================================
+
+FORMAT: [Test Case ID] | [Component] | [Input] | [Expected Output] | [Test Purpose]
+
+=== LLM APIs TESTING ===
+
+TEST CASE 01 | Azure OpenAI API | "What are the symptoms of the common cold?"
+Expected: Response includes runny nose, sneezing, sore throat, cough with proper formatting
+Test Purpose: Verify Azure OpenAI GPT-4o-mini API connection and response generation
+
+TEST CASE 02 | Azure OpenAI API | Query with max tokens limit: "Explain all types of diabetes in detail"
+Expected: Response respects 500 token limit, provides concise but complete information
+Test Purpose: Test API token limit configuration and response truncation
+
+TEST CASE 03 | LLM Fallback | "Tell me about Losartan medication" (not in knowledge base)
+Expected: System queries GPT-4 directly, returns comprehensive information with "GPT-4 Medical Database" source
+Test Purpose: Test fallback mechanism to GPT when knowledge base lacks information
+
+=== ORCHESTRATION (LANGCHAIN) TESTING ===
+
+TEST CASE 04 | LangChain Memory | First: "What is hypertension?" Then: "What are its complications?"
+Expected: Second response understands "its" refers to hypertension, discusses related complications
+Test Purpose: Test ConversationBufferMemory and context retention in LangChain
+
+TEST CASE 05 | LangChain RAG Chain | "How does metformin work for diabetes?"
+Expected: Retrieves relevant documents about metformin and diabetes, combines information coherently
+Test Purpose: Test ConversationalRetrievalChain document retrieval and synthesis
+
+TEST CASE 06 | LangChain Prompt Template | Any medical query
+Expected: Response includes context, chat history integration, and medical disclaimer as per template
+Test Purpose: Verify prompt template formatting and variable injection
+
+=== EMBEDDINGS (HUGGINGFACE) TESTING ===
+
+TEST CASE 07 | HuggingFace Embeddings | "Tell me about aspirin"
+Expected: System embeds query using sentence-transformers/all-MiniLM-L6-v2, retrieves aspirin-related documents
+Test Purpose: Test embedding generation and similarity search
+
+TEST CASE 08 | Embedding Normalization | Query with special characters: "What's the dosage for aspirin/ibuprofen?"
+Expected: Query properly embedded despite special characters, returns relevant results
+Test Purpose: Test embedding normalization and special character handling
+
+TEST CASE 09 | Embedding Performance | Complex medical query with multiple concepts
+Expected: Embedding completes within 2 seconds on CPU, retrieves multi-topic documents
+Test Purpose: Test embedding model performance on CPU configuration
+
+=== VECTOR DATABASE (CHROMA) TESTING ===
+
+TEST CASE 10 | Chroma Storage | Initialize application first time
+Expected: Creates ./chroma_db directory, persists medical knowledge base vectors
+Test Purpose: Test ChromaDB initialization and persistence
+
+TEST CASE 11 | Chroma Retrieval | "What are COVID-19 prevention measures?"
+Expected: Retrieves top 3 most relevant documents about COVID-19 from vector store
+Test Purpose: Test vector similarity search with k=3 configuration
+
+TEST CASE 12 | Chroma Update | Add new medical document to knowledge base and restart
+Expected: New document is indexed, searchable, and retrievable in subsequent queries
+Test Purpose: Test vector store update and re-indexing capability
+
+=== FRONTEND (STREAMLIT) TESTING ===
+
+TEST CASE 13 | Image Upload UI | Upload PNG medicine image with transparency
+Expected: Image displays correctly, converts RGBA to RGB, analyzes without errors
+Test Purpose: Test Streamlit file uploader and image processing
+
+TEST CASE 14 | Chat Interface | Type message and press Enter
+Expected: Message appears in chat history with user avatar, response shows with medical emoji
+Test Purpose: Test Streamlit chat_input and chat_message components
+
+TEST CASE 15 | Quick Questions | Click "What are the symptoms of flu?" button
+Expected: Question auto-fills, processes, and displays response without manual typing
+Test Purpose: Test Streamlit button callbacks and session state management
+
+TEST CASE 16 | Clear History Button | Click "Clear Chat History" after multiple conversations
+Expected: All messages cleared, memory reset, fresh conversation state
+Test Purpose: Test session state clearing and memory management
+
+TEST CASE 17 | Source Display | Query any medical topic
+Expected: Expandable "Sources" section shows with relevant document titles
+Test Purpose: Test Streamlit expander widget and source attribution
+
+=== INTEGRATION TESTING ===
+
+TEST CASE 18 | Medicine Image Analysis | Upload clear aspirin tablet image
+Expected: Vision model identifies as aspirin → RAG retrieves aspirin info → Combined response with dosage/warnings
+Test Purpose: Test image analysis + RAG integration workflow
+
+TEST CASE 19 | Error Handling | Disconnect internet and make query requiring GPT
+Expected: Graceful error message, system remains responsive, suggests checking connection
+Test Purpose: Test error handling and fallback mechanisms
+
+TEST CASE 20 | Performance Test | Submit 5 queries rapidly
+Expected: All queries processed sequentially, no memory overflow, responses remain accurate
+Test Purpose: Test system stability under load and memory management
+
+=== VALIDATION CRITERIA ===
+
+LLM APIs:
+- Azure OpenAI connects successfully
+- Temperature=0.3 provides consistent responses
+- Token limits respected
+- Fallback to GPT works when needed
+
+Orchestration (LangChain):
+- Memory maintains conversation context
+- RAG chain retrieves and combines documents
+- Prompt templates properly formatted
+- Chain execution completes without errors
+
+Embeddings (HuggingFace):
+- CPU-based embeddings work efficiently
+- Normalized embeddings for similarity search
+- All-MiniLM-L6-v2 model loads correctly
+- Embedding dimension compatibility
+
+Vector Database (Chroma):
+- Persistence in ./chroma_db directory
+- Similarity search returns relevant documents
+- K=3 retrieval works correctly
+- Database updates when knowledge base changes
+
+Frontend (Streamlit):
+- All UI components render properly
+- Session state management works
+- File upload handles various image formats
+- Chat interface maintains history
+- Buttons and interactions responsive
