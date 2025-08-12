@@ -1,18 +1,9 @@
-# Core app dependencies
-streamlit>=1.37.0
+streamlit>=1.20.0
 pillow
-
-# LangChain ecosystem
-langchain>=0.2.0
-langchain-community>=0.0.5
+python-dotenv
+langchain
 langchain-openai
-
-# Embeddings & Vector Store
-faiss-cpu
+langchain-community
+chromadb
 sentence-transformers
 
-# Azure OpenAI SDK
-openai>=1.35.0
-
-# Utilities
-python-dotenv
