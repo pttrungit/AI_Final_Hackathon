@@ -8,7 +8,6 @@ This version fixes imports and dependency issues for Streamlit Cloud deployment.
 import streamlit as st
 import os
 from typing import List, Dict, Any
-import json
 import base64
 from datetime import datetime
 from PIL import Image
@@ -20,7 +19,6 @@ import traceback
 try:
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain_community.vectorstores import FAISS
-    from langchain_community.sql import SQLRecordManager  # optional example import
     langchain_community_available = True
 except Exception:
     # Fallback to older langchain names (some environments still have these)
@@ -29,43 +27,44 @@ except Exception:
         from langchain.vectorstores import FAISS
         langchain_community_available = False
     except Exception:
-        st.error("Required LangChain embedding/vectorstore packages are not installed.\nPlease add `langchain-community` or `langchain` + `faiss-cpu` to requirements.txt and redeploy.")
+        st.error(
+            "Required LangChain embedding/vectorstore packages are not installed.\n"
+            "Please add `langchain-community` or `langchain` + `faiss-cpu` to requirements.txt and redeploy."
+        )
         st.stop()
 
 # Core langchain pieces
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
-from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 
 # Azure / OpenAI LLM wrapper
-# The package name / class depends on your langchain + provider integration. We try to import AzureChatOpenAI,
-# otherwise fall back to a generic OpenAI Chat LLM from langchain if available.
+# Try to import AzureChatOpenAI first, otherwise fallback to langchain.chat_models.ChatOpenAI
 llm_class = None
 try:
-    # Newer integrations provide an AzureChatOpenAI wrapper (package: langchain_openai)
     from langchain_openai import AzureChatOpenAI
     llm_class = "azure"
 except Exception:
     try:
-        # Fallback to built-in OpenAI chat LLM in langchain
         from langchain.chat_models import ChatOpenAI
         llm_class = "openai"
     except Exception:
-        st.error("No compatible Chat LLM class found. Please ensure you installed `langchain-openai` or `langchain` with chat model support.")
+        st.error(
+            "No compatible Chat LLM class found. Please ensure you installed `langchain-openai` "
+            "or `langchain` with chat model support."
+        )
         st.stop()
 
 # === Azure OpenAI Configuration with Streamlit Secrets / env ===
-# Do NOT hardcode keys. Use st.secrets for Streamlit Cloud and environment variables for local dev.
 AZURE_OPENAI_API_KEY = None
 AZURE_OPENAI_ENDPOINT = None
 AZURE_DEPLOYMENT_NAME = None
 AZURE_OPENAI_VERSION = None
 
 # Load from Streamlit secrets if available (Streamlit Cloud)
-if "AZURE_OPENAI_API_KEY" in st.secrets:
+if isinstance(st.secrets, dict) and "AZURE_OPENAI_API_KEY" in st.secrets:
     AZURE_OPENAI_API_KEY = st.secrets.get("AZURE_OPENAI_API_KEY")
     AZURE_OPENAI_ENDPOINT = st.secrets.get("AZURE_OPENAI_ENDPOINT")
     AZURE_DEPLOYMENT_NAME = st.secrets.get("AZURE_DEPLOYMENT_NAME")
@@ -107,7 +106,10 @@ def build_llm():
         if llm_class == "azure":
             # Require azure config
             if not AZURE_OPENAI_API_KEY or not AZURE_DEPLOYMENT_NAME:
-                st.error("Azure OpenAI credentials or deployment name missing. Set AZURE_OPENAI_API_KEY and AZURE_DEPLOYMENT_NAME in Streamlit secrets or environment.")
+                st.error(
+                    "Azure OpenAI credentials or deployment name missing. "
+                    "Set AZURE_OPENAI_API_KEY and AZURE_DEPLOYMENT_NAME in Streamlit secrets or environment."
+                )
                 st.stop()
 
             # Set envs used by some SDKs
@@ -125,15 +127,17 @@ def build_llm():
                 )
                 return llm
             except Exception as e:
-                # If the Azure wrapper signature is different, surface a clear error in logs
                 st.warning(f"Could not instantiate AzureChatOpenAI: {e}. Trying generic ChatOpenAI fallback.")
 
         # Fallback to ChatOpenAI
         from langchain.chat_models import ChatOpenAI
-        # If OPENAI_API_KEY is set (could be the same Azure key used as compatibility), it will be used.
+
+        # Use OPENAI_API_KEY if present, otherwise try Azure key for compatibility
         openai_key = os.getenv("OPENAI_API_KEY") or AZURE_OPENAI_API_KEY
         if openai_key:
             os.environ["OPENAI_API_KEY"] = openai_key
+
+        # model_name may vary by your OpenAI access; change as needed
         llm = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini", max_tokens=600)
         return llm
     except Exception as e:
@@ -261,6 +265,7 @@ class HealthcareAssistant:
     def get_response(self, query: str) -> Dict[str, Any]:
         """Get response from RAG system"""
         try:
+            # ConversationalRetrievalChain expects a dict with "question" and optionally "chat_history"
             result = self.qa_chain({"question": query})
             return {
                 "answer": result.get("answer", ""),
@@ -269,23 +274,24 @@ class HealthcareAssistant:
         except Exception as e:
             # Fallback to direct LLM completion if chain fails
             try:
-                # Many LLM wrappers implement __call__ with a prompt; we attempt a safe fallback.
+                # Many LLM wrappers implement generate or __call__ differently; attempt safe fallbacks
                 if hasattr(self.llm, "generate"):
-                    # wrap into simple Document
-                    from langchain.schema import HumanMessage
                     resp = self.llm.generate([{"role": "user", "content": query}])
-                    # The exact response format differs; try to get text safely
                     text = ""
                     if hasattr(resp, "generations"):
-                        # newer langchain generate response
                         gens = resp.generations
                         if gens and len(gens) > 0 and len(gens[0]) > 0:
-                            text = gens[0][0].text
+                            # Some langchain wrappers use .text
+                            text = getattr(gens[0][0], "text", str(gens[0][0]))
                     if not text:
                         text = str(resp)
                     return {"answer": text, "source_documents": []}
 
-                # Last resort: echo the query
+                # Try calling llm directly if callable
+                if callable(self.llm):
+                    out = self.llm(query)
+                    return {"answer": str(out), "source_documents": []}
+
                 return {"answer": f"(LLM fallback) I couldn't run the RAG chain. Your question was: {query}", "source_documents": []}
             except Exception as e2:
                 return {"answer": f"Error: {e} | Fallback error: {e2}", "source_documents": []}
@@ -357,7 +363,8 @@ def main():
                 st.session_state.assistant.memory.clear()
             except Exception:
                 pass
-            st.experimental_rerun()
+            # use new API
+            st.rerun()
 
         st.header("📋 Quick Questions")
         quick_questions = [
@@ -379,7 +386,8 @@ def main():
                         "content": answer,
                         "sources": list(set(sources)) if sources else []
                     })
-                st.experimental_rerun()
+                # use new API
+                st.rerun()
 
     # Main chat area
     st.header("💬 Chat with Healthcare Assistant")
@@ -416,7 +424,8 @@ def main():
                 "sources": sources
             })
 
-        st.experimental_rerun()
+        # use new API
+        st.rerun()
 
 
 if __name__ == "__main__":
