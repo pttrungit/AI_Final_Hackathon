@@ -1,432 +1,606 @@
 """
-Healthcare AI Assistant with RAG and Medicine Image Recognition
-Streamlit Cloud Compatible Version
+Healthcare AI Assistant with RAG + Medicine Image Recognition
+Full-featured Streamlit app (single-file) implementing:
+- UI: Sidebar (About, Features, Important), Center Chat w/ image upload, Right Quick Questions & Common Medicines
+- RAG: Chroma vectorstore + HuggingFace embeddings, conversational retrieval
+- Vision: Vision-capable LLM (AzureChatOpenAI) used for image analysis (placeholder fallback available)
+- Query router, Image processor, Error handler, Response handler
+- Uses streamlit session_state, caches heavy resources with @st.cache_resource
 
-This version fixes imports and dependency issues for Streamlit Cloud deployment.
+Before running:
+- Set secrets in Streamlit Cloud or local env:
+    - AZURE_OPENAI_API_KEY
+    - AZURE_OPENAI_ENDPOINT (optional)
+    - AZURE_DEPLOYMENT_NAME
+    - AZURE_OPENAI_VERSION (optional)
+- Or set OPENAI_API_KEY if using ChatOpenAI fallback.
+
+requirements (summary):
+    streamlit>=1.20.0
+    pillow
+    python-dotenv
+    langchain>=0.0.x
+    langchain-openai
+    langchain-community or chromadb (depending on langchain version)
+    chromadb
+    sentence-transformers
 """
 
-import streamlit as st
 import os
-from typing import List, Dict, Any
-import base64
-from datetime import datetime
-from PIL import Image
 import io
+import json
+import base64
 import traceback
+from typing import List, Dict, Any, Optional
+from datetime import datetime
 
-# === Robust imports for LangChain ecosystem ===
-# Prefer the community package where HuggingFace embeddings and FAISS live now.
+import streamlit as st
+from PIL import Image
+from dotenv import load_dotenv
+
+# load local .env if present (for local dev)
+load_dotenv()
+
+# ---- Robust imports for LangChain / Vectorstores / LLM wrappers ----
+# Try a few variants to be tolerant to version differences
+_chroma_ok = False
+_hf_ok = False
+_llm_wrapper = None
 try:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import FAISS
-    langchain_community_available = True
+    # embeddings
+    from langchain.embeddings import HuggingFaceEmbeddings
+    _hf_ok = True
 except Exception:
-    # Fallback to older langchain names (some environments still have these)
     try:
-        from langchain.embeddings import HuggingFaceEmbeddings
-        from langchain.vectorstores import FAISS
-        langchain_community_available = False
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        _hf_ok = True
     except Exception:
-        st.error(
-            "Required LangChain embedding/vectorstore packages are not installed.\n"
-            "Please add `langchain-community` or `langchain` + `faiss-cpu` to requirements.txt and redeploy."
-        )
-        st.stop()
+        _hf_ok = False
 
-# Core langchain pieces
+# Chroma vectorstore import (varies by version)
+try:
+    from langchain.vectorstores import Chroma
+    _chroma_ok = True
+except Exception:
+    try:
+        # older/newer combos
+        from langchain_community.vectorstores import Chroma
+        _chroma_ok = True
+    except Exception:
+        try:
+            import chromadb
+            from langchain.vectorstores import Chroma
+            _chroma_ok = True
+        except Exception:
+            _chroma_ok = False
+
+# LLM wrappers
+_azure_ok = False
+_openai_ok = False
+try:
+    from langchain_openai import AzureChatOpenAI
+    _azure_ok = True
+    _llm_wrapper = "azure"
+except Exception:
+    try:
+        from langchain.chat_models import ChatOpenAI
+        _openai_ok = True
+        _llm_wrapper = "openai"
+    except Exception:
+        _llm_wrapper = None
+
+# Core langchain building blocks (prompts, chains, memory)
+from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
-from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 
-# Azure / OpenAI LLM wrapper
-# Try to import AzureChatOpenAI first, otherwise fallback to langchain.chat_models.ChatOpenAI
-llm_class = None
-try:
-    from langchain_openai import AzureChatOpenAI
-    llm_class = "azure"
-except Exception:
+# ---- Config / Secrets ----
+# Use st.secrets for Streamlit Cloud. For local dev, rely on environment variables or .env.
+def get_secret(key: str) -> Optional[str]:
+    # prefer st.secrets if available
     try:
-        from langchain.chat_models import ChatOpenAI
-        llm_class = "openai"
+        if key in st.secrets:
+            return st.secrets[key]
     except Exception:
-        st.error(
-            "No compatible Chat LLM class found. Please ensure you installed `langchain-openai` "
-            "or `langchain` with chat model support."
-        )
-        st.stop()
+        pass
+    return os.getenv(key)
 
-# === Azure OpenAI Configuration with Streamlit Secrets / env ===
-AZURE_OPENAI_API_KEY = None
-AZURE_OPENAI_ENDPOINT = None
-AZURE_DEPLOYMENT_NAME = None
-AZURE_OPENAI_VERSION = None
+AZURE_OPENAI_API_KEY = get_secret("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT_NAME = get_secret("AZURE_DEPLOYMENT_NAME")
+AZURE_OPENAI_VERSION = get_secret("AZURE_OPENAI_VERSION") or "2024-07-01-preview"
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 
-# Load from Streamlit secrets if available (Streamlit Cloud)
-if isinstance(st.secrets, dict) and "AZURE_OPENAI_API_KEY" in st.secrets:
-    AZURE_OPENAI_API_KEY = st.secrets.get("AZURE_OPENAI_API_KEY")
-    AZURE_OPENAI_ENDPOINT = st.secrets.get("AZURE_OPENAI_ENDPOINT")
-    AZURE_DEPLOYMENT_NAME = st.secrets.get("AZURE_DEPLOYMENT_NAME")
-    AZURE_OPENAI_VERSION = st.secrets.get("AZURE_OPENAI_VERSION")
-else:
-    # Local dev fallback — expect user to set environment variables.
-    AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-    AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-    AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
-    AZURE_OPENAI_VERSION = os.getenv("AZURE_OPENAI_VERSION")
+# Validate minimal config
+if not _hf_ok:
+    st.error("HuggingFaceEmbeddings not available. Install 'sentence-transformers' and 'langchain-community' or appropriate langchain package.")
+    st.stop()
+if not _chroma_ok:
+    st.error("Chroma vectorstore not available. Install 'chromadb' and compatible 'langchain' package.")
+    st.stop()
+if _llm_wrapper is None:
+    st.warning("No Azure or ChatOpenAI wrapper found. The app will still run but LLM calls may fail. Install 'langchain-openai' or update 'langchain' to include chat_models.")
+    # Do not stop here; allow placeholder/fallback
 
-# === Basic Medical Knowledge Base (small for demo) ===
+# ---- Medical Knowledge Base (sample, can be expanded / loaded from files) ----
 MEDICAL_KNOWLEDGE_BASE = [
-    {
-        "title": "Common Cold",
-        "content": (
-            "The common cold is a viral infection of the upper respiratory tract. "
-            "Symptoms include: runny nose, sneezing, sore throat, cough, congestion, slight body aches, "
-            "mild headache, low-grade fever. Treatment: rest, fluids, over-the-counter pain relievers. "
-            "Prevention: hand washing, avoid touching face, avoid close contact with sick people."
-        )
-    },
-    {
-        "title": "Aspirin",
-        "content": (
-            "Aspirin (acetylsalicylic acid) is a common pain reliever and anti-inflammatory. "
-            "Uses: pain relief, fever reduction, anti-inflammatory, blood clot prevention. "
-            "Dosage: 325-650mg every 4 hours for pain. Low dose (81mg) daily for heart disease prevention. "
-            "Side effects: stomach upset, bleeding risk. Contraindications: bleeding disorders, children with fever."
-        )
-    },
-    # Add other entries as needed...
+    {"title":"Common Cold","content":"The common cold is a viral infection... (see full KB in production)"},
+    {"title":"Aspirin","content":"Aspirin (acetylsalicylic acid) is a common pain reliever..."},
+    {"title":"Ibuprofen","content":"Ibuprofen is an NSAID..."},
+    {"title":"Paracetamol","content":"Paracetamol (acetaminophen) is a pain reliever..."},
+    {"title":"Metformin","content":"Metformin used in Type 2 diabetes..."},
+    # You may expand with the full KB entries you provided earlier
 ]
 
-# === Helper: Safe LLM constructor ===
-def build_llm():
-    """Construct LLM instance based on available wrappers and configuration."""
+# ---- Utility helpers ----
+def now_iso():
+    return datetime.utcnow().isoformat() + "Z"
+
+def safe_get(d, *keys, default=None):
+    cur = d
+    for k in keys:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+# ---- Caching heavy resources ----
+@st.cache_resource
+def get_embeddings():
+    # CPU-friendly huggingface embeddings
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True}
+    )
+
+@st.cache_resource
+def get_chroma(persist_dir: str = "./chroma_db"):
+    # Create or load Chroma vectorstore
+    embeddings = get_embeddings()
+    # Chroma.from_documents will create and persist; allow reloading
     try:
-        if llm_class == "azure":
-            # Require azure config
-            if not AZURE_OPENAI_API_KEY or not AZURE_DEPLOYMENT_NAME:
-                st.error(
-                    "Azure OpenAI credentials or deployment name missing. "
-                    "Set AZURE_OPENAI_API_KEY and AZURE_DEPLOYMENT_NAME in Streamlit secrets or environment."
-                )
-                st.stop()
-
-            # Set envs used by some SDKs
-            os.environ["AZURE_OPENAI_API_KEY"] = AZURE_OPENAI_API_KEY
-            if AZURE_OPENAI_ENDPOINT:
-                os.environ["AZURE_OPENAI_ENDPOINT"] = AZURE_OPENAI_ENDPOINT
-
-            # Construct AzureChatOpenAI — arguments vary by package version; this is a best-effort config.
-            try:
-                llm = AzureChatOpenAI(
-                    azure_deployment=AZURE_DEPLOYMENT_NAME,
-                    api_version=AZURE_OPENAI_VERSION or "2024-07-01-preview",
-                    temperature=0.2,
-                    max_tokens=600,
-                )
-                return llm
-            except Exception as e:
-                st.warning(f"Could not instantiate AzureChatOpenAI: {e}. Trying generic ChatOpenAI fallback.")
-
-        # Fallback to ChatOpenAI
-        from langchain.chat_models import ChatOpenAI
-
-        # Use OPENAI_API_KEY if present, otherwise try Azure key for compatibility
-        openai_key = os.getenv("OPENAI_API_KEY") or AZURE_OPENAI_API_KEY
-        if openai_key:
-            os.environ["OPENAI_API_KEY"] = openai_key
-
-        # model_name may vary by your OpenAI access; change as needed
-        llm = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini", max_tokens=600)
-        return llm
-    except Exception as e:
-        st.error(f"Failed to create LLM instance: {e}\n{traceback.format_exc()}")
-        st.stop()
-
-
-class HealthcareAssistant:
-    """Healthcare Assistant with RAG capabilities"""
-
-    def __init__(self):
-        """Initialize the Healthcare Assistant"""
-        self.embeddings = None
-        self.vectorstore = None
-        self.llm = None
-        self.qa_chain = None
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
-        self.initialize_components()
-
-    def initialize_components(self):
-        """Initialize all components"""
-        try:
-            # Initialize embeddings (CPU-friendly)
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True}
-            )
-
-            # Create documents
-            documents = self.create_documents()
-
-            # Initialize FAISS vector store (in-memory)
-            self.vectorstore = FAISS.from_documents(
-                documents=documents,
-                embedding=self.embeddings
-            )
-
-            # Build LLM
-            self.llm = build_llm()
-
-            # Create prompt template
-            prompt_template = (
-                "You are a professional healthcare AI assistant. Use the following context to answer the question.\n"
-                "Always provide disclaimers about seeking professional medical advice.\n\n"
-                "Context: {context}\n\n"
-                "Chat History: {chat_history}\n\n"
-                "Question: {question}\n\n"
-                "Helpful Answer:"
-            )
-
-            PROMPT = PromptTemplate(
-                template=prompt_template,
-                input_variables=["context", "chat_history", "question"]
-            )
-
-            # Create ConversationalRetrievalChain
-            self.qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=self.llm,
-                retriever=self.vectorstore.as_retriever(search_kwargs={"k": 3}),
-                memory=self.memory,
-                combine_docs_chain_kwargs={"prompt": PROMPT},
-                return_source_documents=True
-            )
-
-        except Exception as e:
-            st.error(f"Initialization error: {e}\n{traceback.format_exc()}")
-            st.stop()
-
-    def create_documents(self) -> List[Document]:
-        """Create documents from knowledge base"""
-        documents: List[Document] = []
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50
-        )
-
+        # create documents from KB if not exists
+        # We build doc list each time to be safe
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        docs = []
         for item in MEDICAL_KNOWLEDGE_BASE:
-            chunks = text_splitter.split_text(item["content"])
-            for chunk in chunks:
-                doc = Document(
-                    page_content=chunk,
-                    metadata={"title": item["title"], "source": "Medical KB"}
-                )
-                documents.append(doc)
-
-        return documents
-
-    def analyze_medicine_image(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Analyze medicine image (placeholder).
-
-        This function currently returns a safe placeholder message. For production, integrate a vision
-        model (Azure Vision, Google Vision, or a hosted image-classification model) and perform
-        OCR / visual matching against a medicine database.
-        """
+            chunks = splitter.split_text(item["content"])
+            for c in chunks:
+                docs.append(Document(page_content=c, metadata={"title": item["title"], "source":"Medical KB"}))
+        vect = Chroma.from_documents(documents=docs, embedding=embeddings, persist_directory=persist_dir)
         try:
-            # Quick attempt: load image and gather metadata (size, mode)
-            img = Image.open(io.BytesIO(image_bytes))
-            width, height = img.size
-            mode = img.mode
+            vect.persist()
+        except Exception:
+            # Some Chroma wrappers automatically persist; ignore if not supported
+            pass
+        return vect
+    except Exception as e:
+        st.error(f"Error initializing Chroma vectorstore: {e}")
+        raise
 
-            analysis = (
-                "This is a placeholder image analysis. For reliable medicine identification, "
-                "please integrate a vision API.\n"
-                f"Image size: {width}x{height}, mode: {mode}.\n"
-                "If you can, describe any imprint/marking/text on the pill, and I can try to help using the knowledge base."
+@st.cache_resource
+def build_llm():
+    # Prefer AzureChatOpenAI; fallback to ChatOpenAI
+    if _llm_wrapper == "azure" and AZURE_OPENAI_API_KEY and AZURE_DEPLOYMENT_NAME:
+        # set environment variables used by some SDKs
+        os.environ["AZURE_OPENAI_API_KEY"] = AZURE_OPENAI_API_KEY
+        if AZURE_OPENAI_ENDPOINT:
+            os.environ["AZURE_OPENAI_ENDPOINT"] = AZURE_OPENAI_ENDPOINT
+        try:
+            llm = AzureChatOpenAI(
+                azure_deployment=AZURE_DEPLOYMENT_NAME,
+                api_version=AZURE_OPENAI_VERSION,
+                temperature=0.2,
+                max_tokens=600,
             )
-
-            return {
-                "image_analysis": analysis,
-                "detailed_info": None,
-                "sources": []
-            }
+            return llm
         except Exception as e:
-            return {
-                "image_analysis": f"Error analyzing image: {e}",
-                "detailed_info": None,
-                "sources": []
-            }
+            st.warning(f"AzureChatOpenAI instantiation failed: {e}. Trying ChatOpenAI fallback.")
 
-    def get_response(self, query: str) -> Dict[str, Any]:
-        """Get response from RAG system"""
+    if _llm_wrapper == "openai" and OPENAI_API_KEY:
+        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
         try:
-            # ConversationalRetrievalChain expects a dict with "question" and optionally "chat_history"
-            result = self.qa_chain({"question": query})
-            return {
-                "answer": result.get("answer", ""),
-                "source_documents": result.get("source_documents", [])
-            }
+            llm = None
+            from langchain.chat_models import ChatOpenAI
+            llm = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini", max_tokens=600, openai_api_key=OPENAI_API_KEY)
+            return llm
         except Exception as e:
-            # Fallback to direct LLM completion if chain fails
-            try:
-                # Many LLM wrappers implement generate or __call__ differently; attempt safe fallbacks
-                if hasattr(self.llm, "generate"):
-                    resp = self.llm.generate([{"role": "user", "content": query}])
-                    text = ""
-                    if hasattr(resp, "generations"):
-                        gens = resp.generations
-                        if gens and len(gens) > 0 and len(gens[0]) > 0:
-                            # Some langchain wrappers use .text
-                            text = getattr(gens[0][0], "text", str(gens[0][0]))
-                    if not text:
-                        text = str(resp)
-                    return {"answer": text, "source_documents": []}
+            st.warning(f"ChatOpenAI instantiation failed: {e}")
 
-                # Try calling llm directly if callable
-                if callable(self.llm):
-                    out = self.llm(query)
-                    return {"answer": str(out), "source_documents": []}
+    # If none available, return None; app will use placeholder responses or error messages
+    return None
 
-                return {"answer": f"(LLM fallback) I couldn't run the RAG chain. Your question was: {query}", "source_documents": []}
-            except Exception as e2:
-                return {"answer": f"Error: {e} | Fallback error: {e2}", "source_documents": []}
+# ---- Image processor ----
+def preprocess_image(image: Image.Image) -> bytes:
+    """
+    Convert uploaded PIL image to a standard JPEG RGB bytes (suitable for base64 embedding)
+    """
+    if image.mode == "RGBA":
+        background = Image.new("RGB", image.size, (255,255,255))
+        background.paste(image, mask=image.split()[3])
+        image = background
+    elif image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    # Resize if extremely large to avoid huge payloads (maintain aspect)
+    max_dim = 1200
+    if max(image.size) > max_dim:
+        ratio = max_dim / max(image.size)
+        image = image.resize((int(image.width*ratio), int(image.height*ratio)))
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
 
-    def add_medical_disclaimer(self, response: str) -> str:
-        """Add medical disclaimer"""
-        disclaimer = "\n\n⚠️ **Medical Disclaimer**: This information is for educational purposes only. Always consult healthcare professionals for medical advice."
-        return response + disclaimer
+def image_to_base64(img_bytes: bytes) -> str:
+    return base64.b64encode(img_bytes).decode("utf-8")
 
+# ---- Vision integration (via LLM chat if it supports images) ----
+def analyze_image_with_llm(llm, img_bytes: bytes) -> str:
+    """
+    Try to call the LLM/vision model to analyze medicine image.
+    This function attempts a few message shapes depending on what the LLM supports.
+    Returns textual analysis string.
+    """
+    if llm is None:
+        return "Vision model not configured. Install and configure AzureChatOpenAI or ChatOpenAI with vision support."
 
-# === Streamlit UI helpers ===
+    base64_image = image_to_base64(img_bytes)
 
+    # Preferred: if llm has 'invoke' method, try sending SystemMessage / HumanMessage
+    try:
+        from langchain.schema.messages import SystemMessage, HumanMessage
+        system = SystemMessage(content=(
+            "You are a medication identification expert. Analyze the medicine image and identify:\n"
+            "1) Likely medication name (generic and brand if visible)\n"
+            "2) Dosage if visible\n"
+            "3) Form (tablet, capsule, etc.)\n"
+            "4) Color and shape\n"
+            "5) Any visible markings or imprints\n"
+            "If you are not certain, say so. Always advise verification with a pharmacist."
+        ))
+        human_content = [
+            {"type": "text", "text": "Please identify the medication in the image. Describe what you see and list possible matches."},
+            {"type":"image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+        ]
+        human = HumanMessage(content=human_content)
+        # Some wrappers expect a list of messages or a single call to invoke
+        if hasattr(llm, "invoke"):
+            resp = llm.invoke([system, human])
+            # resp.content is typical
+            return safe_get(resp.__dict__, "content") or str(resp)
+        elif hasattr(llm, "chat"):
+            # try generic chat
+            resp = llm.chat([system, human])
+            # resp may have .content or .generations
+            text = safe_get(resp.__dict__, "content")
+            if text:
+                return text
+            return str(resp)
+        elif hasattr(llm, "__call__"):
+            # fallback: send text-only prompt describing that image is base64
+            prompt = (
+                    system.content + "\n\n"
+                                     "Image (base64):\n"
+                                     f"{base64_image[:500]}...[truncated]\n\n"
+                                     "Please analyze and respond."
+            )
+            out = llm(prompt)
+            return str(out)
+    except Exception as e:
+        # Last fallback: provide simple guidance
+        return f"Vision call failed: {e}\n(If you configured Azure/OpenAI with vision-capable model, ensure wrapper supports image messages.)"
+
+# ---- RAG / QA chain builder ----
+@st.cache_resource
+def build_rag_chain(chroma_dir: str = "./chroma_db"):
+    chroma = get_chroma(persist_dir=chroma_dir)
+    retriever = chroma.as_retriever(search_kwargs={"k": 3})
+    llm = build_llm()
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True, output_key="answer")
+    prompt_template = (
+        "You are a professional healthcare AI assistant. Use the context below to answer the user's question.\n"
+        "Always remind the user to seek professional medical advice when necessary.\n\n"
+        "Context: {context}\n\n"
+        "Chat History: {chat_history}\n\n"
+        "Question: {question}\n\n"
+        "Helpful Answer:"
+    )
+    PROMPT = PromptTemplate(template=prompt_template, input_variables=["context","chat_history","question"])
+    try:
+        chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=retriever,
+            memory=memory,
+            combine_docs_chain_kwargs={"prompt": PROMPT},
+            return_source_documents=True
+        )
+        return chain
+    except Exception as e:
+        st.warning(f"Could not build ConversationalRetrievalChain automatically: {e}. You may still use direct LLM fallback.")
+        return None
+
+# ---- Response & Error handling ----
+NO_INFO_INDICATORS = [
+    "i don't know", "i do not know", "no information", "not in my knowledge",
+    "cannot find", "no relevant", "i'm not sure", "not found"
+]
+
+def analyze_chain_answer_for_missing(answer: str) -> bool:
+    if not answer:
+        return True
+    al = answer.lower()
+    for ind in NO_INFO_INDICATORS:
+        if ind in al:
+            return True
+    return False
+
+# ---- Initialize session_state ----
 def initialize_session_state():
-    """Initialize Streamlit session state"""
-    if "assistant" not in st.session_state:
-        with st.spinner("🔄 Initializing Healthcare Assistant..."):
-            st.session_state.assistant = HealthcareAssistant()
+    if "assistant_chain" not in st.session_state:
+        st.session_state.assistant_chain = build_rag_chain()
+    if "llm" not in st.session_state:
+        st.session_state.llm = build_llm()
+    if "chroma" not in st.session_state:
+        try:
+            st.session_state.chroma = get_chroma()
+        except Exception:
+            st.session_state.chroma = None
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "last_user_message" not in st.session_state:
+        st.session_state.last_user_message = ""
+    if "upload_preview" not in st.session_state:
+        st.session_state.upload_preview = None
 
+# ---- UI helpers ----
+def add_user_message(content: str, image: Optional[Image.Image] = None):
+    entry = {"role":"user","content":content,"time": now_iso()}
+    if image is not None:
+        entry["image"] = True
+    st.session_state.chat_history.append(entry)
+
+def add_assistant_message(content: str, sources: Optional[List[str]] = None):
+    entry = {"role":"assistant","content":content,"time": now_iso(), "sources": sources or []}
+    st.session_state.chat_history.append(entry)
 
 def display_chat_history():
-    """Display chat history"""
     for message in st.session_state.chat_history:
         if message["role"] == "user":
             with st.chat_message("user"):
+                if message.get("image") and st.session_state.get("upload_preview"):
+                    st.image(st.session_state["upload_preview"], width=220)
                 st.write(message["content"])
         else:
             with st.chat_message("assistant", avatar="🏥"):
-                st.write(message["content"])
+                st.markdown(message["content"])
                 if message.get("sources"):
                     with st.expander("📚 Sources"):
-                        for source in message["sources"]:
-                            st.write(f"- {source}")
+                        for s in message["sources"]:
+                            st.write(f"- {s}")
 
+# ---- Quick questions and common medicines (static lists) ----
+QUICK_QUESTIONS = [
+    "What are the symptoms of flu?",
+    "Tell me about aspirin dosage",
+    "How to manage diabetes?",
+    "What causes headaches?",
+    "COVID-19 prevention tips",
+    "Allergy treatment options",
+    "High blood pressure info",
+    "Paracetamol vs Ibuprofen?"
+]
 
+COMMON_MEDICINES = [
+    "Aspirin", "Ibuprofen", "Paracetamol (Acetaminophen)", "Metformin",
+    "Amoxicillin", "Omeprazole"
+]
+
+# ---- Main App UI ----
 def main():
-    """Main Streamlit app"""
-    st.set_page_config(
-        page_title="Healthcare AI Assistant",
-        page_icon="🏥",
-        layout="wide"
-    )
-
-    # Initialize
+    st.set_page_config(page_title="Healthcare AI Assistant", page_icon="🏥", layout="wide")
     initialize_session_state()
 
-    # Header
-    st.title("🏥 Healthcare AI Assistant")
-    st.markdown("Medical guidance powered by RAG technology")
+    # Top header
+    st.markdown(
+        "<h1 style='font-size:36px;'>🏥 Healthcare AI Assistant with Medicine Recognition</h1>",
+        unsafe_allow_html=True)
+    st.markdown("Your intelligent medical guidance companion powered by RAG technology and image analysis")
 
-    # Sidebar
-    with st.sidebar:
-        st.header("ℹ️ About")
-        st.info(
-            "This AI assistant provides medical information, symptom checking, "
-            "and medication guidance using RAG technology."
-        )
+    # layout: left sidebar, main, right quick
+    left_col, main_col, right_col = st.columns([1.2, 3, 1.1])
 
-        st.header("⚠️ Important")
-        st.warning(
-            "This is for educational purposes only. Always consult healthcare professionals."
-        )
-
-        if st.button("🗑️ Clear Chat"):
+    # --- LEFT SIDEBAR ---
+    with left_col:
+        st.markdown("### ℹ️ About")
+        st.info("This AI assistant provides medical information, symptom checking, medication guidance, and can identify medicines from images using RAG and vision AI.")
+        st.markdown("### 🔧 Features")
+        st.markdown("""
+        - 📷 Medicine Image Analysis (upload clear pill photos)
+        - 🔍 Symptom Analysis
+        - 💊 Medication Info & Dosage
+        - 🩺 Disease Information & Health Tips
+        """)
+        st.markdown("### ⚠️ Important")
+        st.warning("This assistant provides general information only. Always verify medication identification with a pharmacist. Consult healthcare professionals for medical decisions.")
+        if st.button("🗑️ Clear Chat History"):
             st.session_state.chat_history = []
-            # Clear memory if possible
+            # clear memory object if present
             try:
-                st.session_state.assistant.memory.clear()
+                if st.session_state.assistant_chain and hasattr(st.session_state.assistant_chain, "memory"):
+                    st.session_state.assistant_chain.memory.clear()
             except Exception:
                 pass
-            # use new API
             st.rerun()
 
-        st.header("📋 Quick Questions")
-        quick_questions = [
-            "What are flu symptoms?",
-            "Tell me about aspirin",
-            "How to manage diabetes?",
-            "COVID-19 prevention"
-        ]
-
-        for q in quick_questions:
+    # --- RIGHT quick questions ---
+    with right_col:
+        st.markdown("### 📋 Quick Questions")
+        for q in QUICK_QUESTIONS:
             if st.button(q, key=f"quick_{q}"):
-                st.session_state.chat_history.append({"role": "user", "content": q})
-                with st.spinner("Thinking..."):
-                    response = st.session_state.assistant.get_response(q)
-                    answer = st.session_state.assistant.add_medical_disclaimer(response["answer"])
-                    sources = [doc.metadata.get("title", "Unknown") for doc in response.get("source_documents", [])]
-                    st.session_state.chat_history.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "sources": list(set(sources)) if sources else []
-                    })
-                # use new API
+                # push into flow
+                st.session_state.last_user_message = q
+                add_user_message(q)
+                process_user_query(q)
                 st.rerun()
 
-    # Main chat area
-    st.header("💬 Chat with Healthcare Assistant")
+        st.markdown("### 💊 Common Medicines")
+        st.info("\n".join(f"- {m}" for m in COMMON_MEDICINES))
 
-    # Display chat history
-    display_chat_history()
+    # --- MAIN CENTER: Chat and Upload ---
+    with main_col:
+        st.markdown("## 💬 Chat with Healthcare Assistant")
 
-    # Chat input
-    user_query = st.chat_input("Ask about symptoms, medications, or health conditions...")
+        # Image upload expander
+        with st.expander("📷 Upload Medicine Image for Identification", expanded=True):
+            uploaded_file = st.file_uploader(
+                "Upload a clear image of the medicine (pill, tablet, capsule). Show any imprints.",
+                type=['png','jpg','jpeg'], accept_multiple_files=False
+            )
+            if uploaded_file:
+                try:
+                    pil_image = Image.open(uploaded_file)
+                    st.session_state["upload_preview"] = pil_image
+                    st.image(pil_image, caption="Uploaded Medicine", width=320)
+                except Exception as e:
+                    st.error(f"Could not read image: {e}")
 
-    if user_query:
-        # Add user message
-        st.session_state.chat_history.append({
-            "role": "user",
-            "content": user_query
-        })
+                if st.button("🔍 Analyze Medicine"):
+                    # Preprocess and call vision
+                    try:
+                        img_bytes = preprocess_image(pil_image)
+                        add_user_message("Please identify this medicine from the image.", image=pil_image)
+                        with st.spinner("Analyzing medicine image..."):
+                            llm = st.session_state.llm
+                            analysis = analyze_image_with_llm(llm, img_bytes)
+                            # after analysis, do a KB search for additional info
+                            rag = st.session_state.assistant_chain
+                            detailed_info = None
+                            sources = []
+                            if rag:
+                                # Form a query based on analysis summary (short)
+                                search_q = f"Provide details about this medication candidate: {analysis[:200]}"
+                                try:
+                                    rag_result = rag({"question": search_q})
+                                    detailed_info = safe_get(rag_result, "answer", default=None) or None
+                                    docs = safe_get(rag_result, "source_documents", default=[])
+                                    if docs:
+                                        for d in docs:
+                                            try:
+                                                sources.append(d.metadata.get("title", "Unknown"))
+                                            except Exception:
+                                                pass
+                                except Exception as e:
+                                    # ignore rag failure; we'll still return analysis
+                                    detailed_info = None
+                            # Build assistant response
+                            response_text = f"**Image Analysis Results:**\n\n{analysis}"
+                            if detailed_info:
+                                response_text += f"\n\n**Additional Info (from KB):**\n{detailed_info}"
+                            # Append disclaimer
+                            response_text = add_medical_disclaimer(response_text)
+                            add_assistant_message(response_text, sources=list(dict.fromkeys(sources)))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Image analysis failed: {e}\n{traceback.format_exc()}")
 
-        # Get response
-        with st.spinner("🤔 Thinking..."):
-            response = st.session_state.assistant.get_response(user_query)
-            answer_with_disclaimer = st.session_state.assistant.add_medical_disclaimer(response["answer"])
+        # Display chat history
+        display_chat_history()
 
-            # Extract sources
-            sources = []
-            for doc in response.get("source_documents", []):
-                title = doc.metadata.get("title", "Unknown")
-                if title not in sources:
-                    sources.append(title)
+        # Chat input
+        user_input = st.chat_input("Ask about symptoms, medications, or health conditions...")
+        if user_input:
+            st.session_state.last_user_message = user_input
+            add_user_message(user_input)
+            process_user_query(user_input)
+            st.rerun()
 
-            # Add assistant response
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": answer_with_disclaimer,
-                "sources": sources
-            })
+# ---- Core processing pipeline (query router + handlers) ----
+def process_user_query(query: str):
+    """
+    Decide whether to route to RAG or direct LLM, run the chain or LLM, handle fallback,
+    and append an assistant response into chat history.
+    """
+    rag = st.session_state.get("assistant_chain")
+    llm = st.session_state.get("llm")
 
-        # use new API
-        st.rerun()
+    # Try RAG first if available
+    if rag:
+        try:
+            with st.spinner("Retrieving from knowledge base..."):
+                result = rag({"question": query})
+            answer = result.get("answer", "")
+            # If RAG didn't find good info, fallback to GPT
+            if analyze_chain_answer_for_missing(answer):
+                # fallback to LLM
+                fallback_text = call_llm_direct(llm, query)
+                combined = f"**(Fallback from KB)**\n\n{fallback_text}"
+                combined = add_medical_disclaimer(combined)
+                add_assistant_message(combined, sources=[])
+            else:
+                # Good answer from KB
+                answer_with_disclaimer = add_medical_disclaimer(answer)
+                docs = result.get("source_documents", [])
+                source_titles = []
+                for d in docs:
+                    try:
+                        source_titles.append(d.metadata.get("title","Unknown"))
+                    except Exception:
+                        pass
+                add_assistant_message(answer_with_disclaimer, sources=list(dict.fromkeys(source_titles)))
+            return
+        except Exception as e:
+            # On chain error, fallback to direct LLM
+            st.warning(f"RAG chain error: {e}. Falling back to direct LLM.")
+    # If no rag or failed, use LLM
+    fallback_text = call_llm_direct(llm, query)
+    fallback_text = add_medical_disclaimer(fallback_text)
+    add_assistant_message(fallback_text, sources=[])
 
+def call_llm_direct(llm, query: str) -> str:
+    """
+    Call LLM directly to produce medical information. Returns string.
+    """
+    if llm is None:
+        return "LLM not configured. Please set AZURE_OPENAI_API_KEY (Azure) or OPENAI_API_KEY (OpenAI) and ensure langchain wrappers are installed."
 
+    # Build a safety prompt structure for medical info
+    prompt = (
+        "You are a medical information assistant. Provide accurate, evidence-based information. "
+        "If uncertain, say so and advise consulting a healthcare professional.\n\n"
+        f"User Query: {query}\n\n"
+        "Answer in a clear, structured manner (Definition, Symptoms, Treatment, When to seek help)."
+    )
+    try:
+        # Try common interfaces
+        if hasattr(llm, "invoke"):
+            messages = [
+                {"role":"system","content":"You are a helpful medical assistant."},
+                {"role":"user","content": prompt}
+            ]
+            resp = llm.invoke(messages)
+            return safe_get(resp.__dict__, "content") or str(resp)
+        elif hasattr(llm, "generate"):
+            # some wrappers use generate with messages or prompt
+            resp = llm.generate([{"role":"user","content": prompt}])
+            # extract text if possible
+            try:
+                gens = resp.generations
+                if gens and len(gens) > 0 and len(gens[0]) > 0:
+                    return getattr(gens[0][0], "text", str(gens[0][0]))
+            except Exception:
+                return str(resp)
+        elif callable(llm):
+            out = llm(prompt)
+            return str(out)
+    except Exception as e:
+        return f"LLM call error: {e}"
+
+def add_medical_disclaimer(response: str) -> str:
+    return response + "\n\n⚠️ **Medical Disclaimer**: This information is for educational purposes only. Always consult a qualified healthcare professional for medical advice. For medication identification, always verify with a licensed pharmacist."
+
+# ---- Run app ----
 if __name__ == "__main__":
     main()
