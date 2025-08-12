@@ -12,11 +12,11 @@ import base64
 from PIL import Image
 import io
 
-# Vector Database and RAG imports
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Chroma
+# Vector Database and RAG imports - FIXED FOR STREAMLIT CLOUD
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+from langchain.schema.document import Document
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_openai import AzureChatOpenAI
@@ -24,11 +24,19 @@ from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.schema.messages import HumanMessage, SystemMessage
 
-# Azure OpenAI Configuration
-AZURE_OPENAI_API_KEY = "sk-GQ1M8LeXBpca_FNVSNDByA"
-AZURE_OPENAI_ENDPOINT = "https://aiportalapi.stu-platform.live/jpe"
-AZURE_DEPLOYMENT_NAME = "GPT-4o-mini"
-AZURE_OPENAI_VERSION = "2024-07-01-preview"
+# Azure OpenAI Configuration with Streamlit Secrets
+try:
+    # For Streamlit Cloud deployment
+    AZURE_OPENAI_API_KEY = st.secrets["AZURE_OPENAI_API_KEY"]
+    AZURE_OPENAI_ENDPOINT = st.secrets["AZURE_OPENAI_ENDPOINT"]
+    AZURE_DEPLOYMENT_NAME = st.secrets["AZURE_DEPLOYMENT_NAME"]
+    AZURE_OPENAI_VERSION = st.secrets["AZURE_OPENAI_VERSION"]
+except:
+    # For local development
+    AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "sk-GQ1M8LeXBpca_FNVSNDByA")
+    AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://aiportalapi.stu-platform.live/jpe")
+    AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME", "GPT-4o-mini")
+    AZURE_OPENAI_VERSION = os.getenv("AZURE_OPENAI_VERSION", "2024-07-01-preview")
 
 # Medical Knowledge Base (Sample data - in production, this would be from medical databases)
 MEDICAL_KNOWLEDGE_BASE = [
@@ -174,11 +182,15 @@ class HealthcareAssistant:
             # Create documents from knowledge base
             documents = self.create_documents()
             
+            # Use temporary directory for ChromaDB in Streamlit Cloud
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            
             # Initialize vector store
             self.vectorstore = Chroma.from_documents(
                 documents=documents,
                 embedding=self.embeddings,
-                persist_directory="./chroma_db"
+                persist_directory=temp_dir
             )
             
             # Initialize Azure OpenAI with correct configuration
